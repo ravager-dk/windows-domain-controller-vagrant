@@ -3,11 +3,40 @@ ENV['VAGRANT_EXPERIMENTAL'] = 'typed_triggers'
 
 $domain = "example.com"
 $domain_ip_address = "192.168.56.2"
+$ums_ip_address = "192.168.56.3"
 
 Vagrant.configure("2") do |config|
     config.vm.box = "windows-2022-uefi-amd64"
-    config.vm.define "windows-domain-controller"
-    config.vm.hostname = "dc"
+    config.vm.define "windows-domain-controller" do |dc|
+        dc.vm.hostname = "dc"
+        dc.vm.network "private_network", ip: $domain_ip_address, libvirt__forward_mode: "route", libvirt__dhcp_enabled: false
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: ["domain-controller.ps1", $domain]
+        dc.vm.provision "shell", reboot: true
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "domain-controller-wait-for-ready.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "set-vagrant-domain-admin.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "domain-controller-configure.ps1"
+        dc.vm.provision "shell", inline: "$env:chocolateyVersion='2.5.0'; Invoke-Expression (New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')", name: "Install Chocolatey"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "provision-base.ps1"
+        dc.vm.provision "shell", reboot: true
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "domain-controller-wait-for-ready.ps1"
+        # TODO after https://github.com/FriedrichWeinmann/GPOTools/issues/5#issuecomment-781598022 is fixed use ps.ps1 to call provision-gpos.ps1.
+        dc.vm.provision "shell", inline: "cd c:/vagrant/provision; ./provision-gpos.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "ad-explorer.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "ca.ps1"
+        dc.vm.provision "shell", reboot: true
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "provision-winrm-https-listener.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "provision-msys2.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "provision-firewall.ps1"
+        dc.vm.provision "shell", path: "provision/ps.ps1", args: "summary.ps1"
+    end
+
+    config.vm.define "ums" do |ums|
+        ums.vm.hostname = "ums"
+        ums.vm.network "private_network", ip: $ums_ip_address, libvirt__forward_mode: "route", libvirt__dhcp_enabled: false
+        ums.vm.provision "shell", path: "provision/ps.ps1", args: "sysprep.ps1", reboot: true
+        ums.vm.provision "shell", path: "provision/ps.ps1", args: ["ums-join-domain.ps1", $domain, $domain_ip_address]
+        ums.vm.provision "shell", reboot: true
+    end
 
     # use the plaintext WinRM transport and force it to use basic authentication.
     # NB this is needed because the default negotiate transport stops working
@@ -17,79 +46,26 @@ Vagrant.configure("2") do |config|
     config.winrm.basic_auth_only = true
 
     config.vm.provider :libvirt do |lv, config|
+        lv.loader = "/usr/share/edk2/ovmf/OVMF_CODE.fd"
+        lv.machine_type = 'q35'
         lv.memory = 2048
         lv.cpus = 2
         lv.cpu_mode = 'host-passthrough'
         lv.keymap = 'pt'
+        lv.input :type => "tablet", :bus => "virtio"
+
+        # Enable Hyper-V enlightenments for performance and stability
+        lv.features = ['acpi', 'apic', 'pae']
+        lv.hyperv_feature :name => 'relaxed',   :state => 'on'
+        lv.hyperv_feature :name => 'vapic',     :state => 'on'
+        lv.hyperv_feature :name => 'spinlocks', :state => 'on', :retries => '8191'
+
+        # Configure timers for Windows stability
+        lv.clock_timer :name => 'hypervclock', :present => 'yes'
+        lv.clock_timer :name => 'hpet', :present => 'yes'
+
         # replace the default synced_folder with something that works in the base box.
         # NB for some reason, this does not work when placed in the base box Vagrantfile.
-        config.vm.synced_folder '.', '/vagrant', type: 'smb', smb_username: ENV['USER'], smb_password: ENV['VAGRANT_SMB_PASSWORD']
+        config.vm.synced_folder '.', '/vagrant', type: 'rsync', rsync__exclude: ['.git/', '.vagrant/', 'packer_cache/', '*.box', '*.iso', '*.log']
     end
-
-    config.vm.provider :hyperv do |hv, config|
-        hv.linked_clone = true
-        hv.enable_virtualization_extensions = false # nested virtualization.
-        hv.cpus = 2
-        hv.memory = 2048
-        hv.vlan_id = ENV['HYPERV_VLAN_ID']
-        # set the management network adapter.
-        # see https://github.com/hashicorp/vagrant/issues/7915
-        # see https://github.com/hashicorp/vagrant/blob/10faa599e7c10541f8b7acf2f8a23727d4d44b6e/plugins/providers/hyperv/action/configure.rb#L21-L35
-        config.vm.network :private_network,
-            bridge: ENV['HYPERV_SWITCH_NAME'] if ENV['HYPERV_SWITCH_NAME']
-        config.vm.synced_folder '.', '/vagrant',
-            type: 'smb',
-            smb_username: ENV['VAGRANT_SMB_USERNAME'] || ENV['USER'],
-            smb_password: ENV['VAGRANT_SMB_PASSWORD']
-        # further configure the VM (e.g. manage the network adapters).
-        config.trigger.before :'VagrantPlugins::HyperV::Action::StartInstance', type: :action do |trigger|
-            trigger.ruby do |env, machine|
-                # see https://github.com/hashicorp/vagrant/blob/v2.2.10/lib/vagrant/machine.rb#L13
-                # see https://github.com/hashicorp/vagrant/blob/v2.2.10/plugins/kernel_v2/config/vm.rb#L716
-                bridges = machine.config.vm.networks.select{|type, options| type == :private_network && options.key?(:hyperv__bridge)}.map do |type, options|
-                    mac_address_spoofing = false
-                    mac_address_spoofing = options[:hyperv__mac_address_spoofing] if options.key?(:hyperv__mac_address_spoofing)
-                    [options[:hyperv__bridge], mac_address_spoofing]
-                end
-                system(
-                    'PowerShell',
-                    '-NoLogo',
-                    '-NoProfile',
-                    '-ExecutionPolicy',
-                    'Bypass',
-                    '-File',
-                    'provision/configure-hyperv-host.ps1',
-                    machine.id,
-                    bridges.to_json
-                )
-                raise "failed to configure hyper-v with exit code #{$?.exitstatus}" if $?.exitstatus != 0
-            end
-        end
-    end
-
-    config.vm.network "private_network",
-        ip: $domain_ip_address,
-        libvirt__forward_mode: "route",
-        libvirt__dhcp_enabled: false,
-        hyperv__bridge: "windows-domain-controller"
-
-    config.vm.provision "shell", path: "provision/ps.ps1", args: ["configure-hyperv-guest.ps1", $domain_ip_address]
-    config.vm.provision "shell", path: "provision/ps.ps1", args: ["domain-controller.ps1", $domain]
-    config.vm.provision "shell", reboot: true
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "domain-controller-wait-for-ready.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "set-vagrant-domain-admin.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "domain-controller-configure.ps1"
-    config.vm.provision "shell", inline: "$env:chocolateyVersion='2.5.0'; Invoke-Expression (New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')", name: "Install Chocolatey"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "provision-base.ps1"
-    config.vm.provision "shell", reboot: true
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "domain-controller-wait-for-ready.ps1"
-    # TODO after https://github.com/FriedrichWeinmann/GPOTools/issues/5#issuecomment-781598022 is fixed use ps.ps1 to call provision-gpos.ps1.
-    config.vm.provision "shell", inline: "cd c:/vagrant/provision; ./provision-gpos.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "ad-explorer.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "ca.ps1"
-    config.vm.provision "shell", reboot: true
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "provision-winrm-https-listener.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "provision-msys2.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "provision-firewall.ps1"
-    config.vm.provision "shell", path: "provision/ps.ps1", args: "summary.ps1"
 end

@@ -28,9 +28,27 @@ This setup will use the following static IP addresses:
 
 # Usage
 
-Install the [Windows 2022 UEFI base box](https://github.com/rgl/windows-vagrant).
+This Vagrant project depends on the `windows-2022-uefi-amd64` and `ubuntu-22.04-uefi-amd64` base boxes.
 
-Install the [Ubuntu 22.04 UEFI base box](https://github.com/rgl/ubuntu-vagrant).
+1. Build the `windows-2022-uefi-amd64` base box locally from the included submodule. To do this using `make` and Packer:
+
+    ```bash
+    # Ensure you are in the submodule directory
+    cd windows-vagrant
+    
+    # Build the libvirt image
+    make build-libvirt
+    
+    # Add the freshly built image to Vagrant
+    vagrant box add windows-2022-uefi-amd64 windows-2022-uefi-amd64-libvirt.box
+    
+    # Return to the parent project directory
+    cd ..
+    ```
+
+    **(Optionally) Instructions for Hyper-V or other providers differ slightly (`make build-hyperv` and box name `windows-2022-uefi-amd64-hyperv.box`).**
+
+2. Install the [Ubuntu 22.04 UEFI base box](https://github.com/rgl/ubuntu-vagrant) via standard Vagrant Cloud if available or build it similarly.
 
 Install the required Vagrant plugins:
 
